@@ -33,7 +33,14 @@ def sparse_corrcoef(A, B=None):
     # version-dependent sparse-dense arithmetic (scipy >= 1.14 / numpy >= 1.25).
     rowsum = np.asarray(A.sum(1)).flatten()          # shape (n_rows,) ndarray
     centering = np.outer(rowsum, rowsum) / n         # explicit outer product
-    C = (np.asarray(A.dot(A.T.conjugate()).todense()) - centering) / (n - 1)
+    # Handle both sparse matrices (from collect_residue_contacts) and
+    # plain ndarrays (from tests or direct calls).
+    dot = A.dot(A.T.conjugate())
+    if sparse.issparse(dot):
+        dot = np.asarray(dot.todense())
+    else:
+        dot = np.asarray(dot)
+    C = (dot - centering) / (n - 1)
     # The correlation coefficients are given by
     # C_{i,j} / sqrt(C_{i} * C_{j})
     d = np.diag(C)
