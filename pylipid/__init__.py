@@ -28,6 +28,7 @@ except RuntimeError:
     pass
 
 # Use a non-interactive backend so importing PyLipID never loads macOS AppKit
+try:
     import matplotlib
     matplotlib.use("Agg", force=True)
 except Exception:
