@@ -14,5 +14,25 @@
 # copies or substantial portions of the Software.
 ##############################################################################
 
+# --- BEGIN: macOS-safe bootstrap -------------------------------------------
+# Ensures PyLipID runs safely on macOS by:
+#   1) forcing multiprocessing to use 'spawn'
+#   2) preventing GUI backends from loading in worker processes
+import multiprocessing as _mp
+
+try:
+    # Safe on macOS — harmless on Linux/Windows
+    _mp.set_start_method("spawn", force=True)
+except RuntimeError:
+    # Already set or protected — ignore
+    pass
+
+# Use a non-interactive backend so importing PyLipID never loads macOS AppKit
+    import matplotlib
+    matplotlib.use("Agg", force=True)
+except Exception:
+    pass
+# --- END: macOS-safe bootstrap ---------------------------------------------
+
 from ._version import __version__
 from .api import LipidInteraction
