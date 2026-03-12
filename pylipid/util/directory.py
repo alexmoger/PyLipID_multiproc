@@ -21,17 +21,19 @@ import os
 __all__ = ["check_dir"]
 
 
-def check_dir(root, name=None):
+def check_dir(root, name=None, print_info=True):
     """
-    Create a directory under 'root'. If 'name' is provided, the directory
-    will be root/name. Returns the full path.
+    Create (if needed) and return a directory under 'root'.
+    If 'name' is provided, the directory will be 'root/name'.
+    Set print_info=False to suppress the creation message.
     """
     import os
 
     path = os.path.join(root, name) if name is not None else root
 
     if not os.path.isdir(path):
-        print(f"Creating new directory: {path}")
+        if print_info:
+            print(f"Creating new directory: {path}")
         os.makedirs(path, exist_ok=True)
 
     return path
