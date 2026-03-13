@@ -1277,7 +1277,7 @@ class LipidInteraction:
             n_workers = min(n_workers, max(1, len(selected_bs_id)))
             print(f"[PyLipID] Starting multiprocessing for bound pose scoring/clustering… "
                   f"(sites={len(selected_bs_id)}, workers={n_workers})")
-            print(f"[PyLipID] Tip: reduce num_cpus or set n_top_poses=0 / n_clusters=0 to speed up.")
+            #print(f"[PyLipID] Reducing num_cpus or set n_top_poses=0 / n_clusters=0 to speed up.")
         
             # Prepare the task closure
             task = partial(analyze_pose_wrapper,
@@ -1296,6 +1296,7 @@ class LipidInteraction:
                            trajfile_list=self._trajfile_list)
         
             # Run in parallel with a visible tqdm progress bar
+            print("[PyLipID] Calculating binding-site koff values… this may take some time.")
             rmsd_set = _spawn_pmap(task,
                                    selected_bs_id,
                                    [pose_traj[bs_id] for bs_id in selected_bs_id],
@@ -1303,7 +1304,7 @@ class LipidInteraction:
                                    [pose_info[bs_id] for bs_id in selected_bs_id],
                                    num_cpus=num_cpus,
                                    desc="ANALYZE BOUND POSES")
-        
+            print("[PyLipID] Finished calculating binding-site koff values.")  
             # Collect RMSD output per site and update per-residue RMSD column
             for bs_id, rmsd in zip(selected_bs_id, rmsd_set):
                 RMSD_set[f"Binding Site {bs_id}"] = rmsd
