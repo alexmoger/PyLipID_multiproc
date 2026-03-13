@@ -1263,7 +1263,7 @@ class LipidInteraction:
         if score_weights is not None:
             translate = {atom_idx: score_weights[self._lipid_ref.top.atom(atom_idx).name]
                          for atom_idx in np.arange(self._lipid_ref.n_atoms)
-                         if self._lipid_Ref.top.atom(atom_idx).name in score_weights.keys()}
+                         if self._lipid_ref.top.atom(atom_idx).name in score_weights.keys()}
             atom_weights.update(translate)
         
         RMSD_set = {}
@@ -1296,7 +1296,7 @@ class LipidInteraction:
                            trajfile_list=self._trajfile_list)
         
             # Run in parallel with a visible tqdm progress bar
-            print("[PyLipID] Calculating binding-site koff values… this may take some time.")
+            print("[PyLipID] Scoring and clustering bound poses… this may take some time.")
             rmsd_set = _spawn_pmap(task,
                                    selected_bs_id,
                                    [pose_traj[bs_id] for bs_id in selected_bs_id],
@@ -1304,7 +1304,7 @@ class LipidInteraction:
                                    [pose_info[bs_id] for bs_id in selected_bs_id],
                                    num_cpus=num_cpus,
                                    desc="ANALYZE BOUND POSES")
-            print("[PyLipID] Finished calculating binding-site koff values.")  
+            print("[PyLipID] Finished clustering.")  
             # Collect RMSD output per site and update per-residue RMSD column
             for bs_id, rmsd in zip(selected_bs_id, rmsd_set):
                 RMSD_set[f"Binding Site {bs_id}"] = rmsd

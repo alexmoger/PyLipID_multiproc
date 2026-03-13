@@ -201,16 +201,28 @@ def collect_bound_poses(binding_site_map, contact_residue_index, trajfile_list, 
                 contact_BS = [np.unique(np.concatenate(
                     [contact_residue_index[node][list_to_take][frame_idx] for node in nodes]))
                     for frame_idx in range(traj.n_frames)]
-                for frame_id in range(len(contact_BS)):
-                    if len(contact_BS[frame_id]) > 0:
-                        for lipid_id in contact_BS[frame_id]:
-                            lipid_residue_index = lipid_residue_index_set[int(lipid_id)]
-                            lipid_atom_indices = np.sort(
-                                [atom.index for atom in traj.top.residue(lipid_residue_index).atoms])
-                            pose_pool[bs_id].append(
-                                [np.copy(traj.xyz[frame_id, np.hstack([protein_indices, lipid_atom_indices])]),
-                                 np.copy(traj.unitcell_angles[frame_id]), np.copy(traj.unitcell_lengths[frame_id])])
-                            pose_info[bs_id].append((traj_idx, protein_idx, lipid_residue_index, frame_id*traj.timestep))
+                # Group (frame_id, lipid_res_idx) pairs by lipid molecule so we can
+                # batch-extract all frames for each lipid with a single numpy slice
+                # instead of copying coordinates one frame at a time.
+                lip_frames = defaultdict(list)   # {lipid_res_idx: [frame_ids]}
+                for frame_id, lipids_at_frame in enumerate(contact_BS):
+                    for lipid_id in lipids_at_frame:
+                        lip_res_idx = lipid_residue_index_set[int(lipid_id)]
+                        lip_frames[lip_res_idx].append(frame_id)
+                for lip_res_idx, frame_ids in lip_frames.items():
+                    lip_atoms = np.sort(
+                        [atom.index for atom in traj.top.residue(lip_res_idx).atoms])
+                    combined = np.hstack([protein_indices, lip_atoms])
+                    frame_arr = np.array(frame_ids)
+                    # Single batch slice for all frames of this lipid
+                    batch_xyz     = traj.xyz[frame_arr][:, combined]
+                    batch_angles  = traj.unitcell_angles[frame_arr]
+                    batch_lengths = traj.unitcell_lengths[frame_arr]
+                    for i, frame_id in enumerate(frame_ids):
+                        pose_pool[bs_id].append(
+                            [batch_xyz[i], batch_angles[i], batch_lengths[i]])
+                        pose_info[bs_id].append(
+                            (traj_idx, protein_idx, lip_res_idx, frame_id * traj.timestep))
     pose_traj = {}
     for bs_id in pose_pool.keys():
         pose_traj[bs_id] = md.Trajectory([frame[0] for frame in pose_pool[bs_id]], joined_top,
@@ -250,12 +262,30 @@ def vectorize_poses(bound_poses, binding_nodes, protein_atom_indices, lipid_atom
         The distance matrix of the bound poses, in the shape of [n_lipid_atoms, n_poses, n_binding_site_residues]
 
     """
-    # calculate distance to binding site residues for each lipid atom
-    dist_per_atom = np.array(
-        [np.array([md.compute_distances(bound_poses,
-                                        list(product([lipid_atom_indices[idx]], protein_atom_indices[node])),
-                                        periodic=True).min(axis=1) for node in binding_nodes]).T
-         for idx in np.arange(len(lipid_atom_indices))])  # shape: [n_lipid_atoms, n_poses, n_BS_residues]
+    n_lip   = len(lipid_atom_indices)
+    n_nodes = len(binding_nodes)
+
+    # Build one flat pair list covering every (lipid_atom × node_residue_atom) combination.
+    # block_starts[i] marks where the i-th (lipid_atom, node) block begins so that
+    # np.minimum.reduceat can collapse each block to its per-residue minimum in one pass.
+    # This replaces n_lip * n_nodes separate md.compute_distances calls with a single call.
+    all_pairs    = []
+    block_starts = []   # length = n_lip * n_nodes
+
+    for lip_atom in lipid_atom_indices:
+        for node in binding_nodes:
+            block_starts.append(len(all_pairs))
+            for prot_atom in protein_atom_indices[node]:
+                all_pairs.append((lip_atom, prot_atom))
+
+    # One call → shape [n_frames, n_total_pairs]
+    all_dists = md.compute_distances(bound_poses, all_pairs, periodic=True)
+
+    # Per-block minimum → shape [n_frames, n_lip * n_nodes]
+    min_dists = np.minimum.reduceat(all_dists, block_starts, axis=1)
+
+    # Reshape to [n_frames, n_lip, n_nodes] then transpose → [n_lip, n_frames, n_nodes]
+    dist_per_atom = min_dists.reshape(bound_poses.n_frames, n_lip, n_nodes).transpose(1, 0, 2)
     return dist_per_atom
 
 
@@ -521,9 +551,10 @@ def analyze_pose_wrapper(bs_id, bound_poses, binding_nodes, pose_info, pose_dir=
         _write_pose_info([pose_info[int(pose_idx)] for pose_idx in selected_pose_indices],
                               f"{pose_dir_clustered}/pose_info.txt", trajfile_list)
     ## calculate RMSD ##
-    dist_mean = np.mean(lipid_dist_per_pose, axis=0)
-    pose_rmsds = [rmsd(lipid_dist_per_pose[pose_id], dist_mean)
-                  for pose_id in np.arange(len(lipid_dist_per_pose))]
+    # lipid_dist_per_pose is already computed above; vectorise over all poses at once
+    # instead of looping frame by frame.
+    dist_mean  = lipid_dist_per_pose.mean(axis=0)
+    pose_rmsds = np.sqrt(((lipid_dist_per_pose - dist_mean) ** 2).mean(axis=1)).tolist()
     return pose_rmsds
 
 
