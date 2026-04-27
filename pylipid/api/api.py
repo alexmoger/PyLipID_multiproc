@@ -39,6 +39,10 @@ from ..plot import plot_surface_area, plot_binding_site_data
 from ..plot import plot_residue_data, plot_corrcoef, plot_residue_data_logo
 from ..util import check_dir, write_PDB, write_pymol_script, sparse_corrcoef, get_traj_info
 
+from multiprocessing import cpu_count, Pool
+
+
+
 def _spawn_pmap(func, *iterables, num_cpus=None, desc=None):
     """Parallel map using multiprocessing with 'spawn' (macOS-safe)."""
     iterables = [list(it) for it in iterables]
@@ -54,9 +58,37 @@ def _spawn_pmap(func, *iterables, num_cpus=None, desc=None):
     with ctx.Pool(processes=num_cpus) as pool:
         return list(tqdm(pool.starmap(func, args_iterable), total=n, desc=desc))
 
+# function run once per thread when initialised, loads traj data
+def init_worker(traj, lipid_residue_atomid_list):
+    global _traj, _lipid_residue_atomid_list
+    _traj = traj
+    _lipid_residue_atomid_list = lipid_residue_atomid_list
+
+#  computationally heavy iterated work in collect_residue_contacts, parallised with multiprocessing
+def process_res(args):
+    # args sent as tuple, initialised here
+    residue_atom_indices, cutoffs, ncol_start, ncol_per_protein, protein_idx, residue_id = args 
+    # loads global variables initialised in init_worker func 
+    traj = _traj
+    lipid_residue_atomid_list = _lipid_residue_atomid_list
+    # calculate interaction per residue  --  untouched from original api
+    dist_matrix = np.array([np.min(
+        md.compute_distances(traj, np.array(list(product(residue_atom_indices, lipid_atom_indices))),
+                                periodic=True, opt=True),
+        axis=1) for lipid_atom_indices in lipid_residue_atomid_list])
+    contact_low, frame_id_set_low, lipid_id_set_low = cal_contact_residues(dist_matrix, cutoffs[0])
+    contact_high, _, _ = cal_contact_residues(dist_matrix, cutoffs[1])
+    # data appended after parallelisation
+    _col = [ncol_start + ncol_per_protein * protein_idx + lipid_id * traj.n_frames +
+                frame_id for frame_id, lipid_id in zip(frame_id_set_low, lipid_id_set_low)]
+    _row = [residue_id] * len(frame_id_set_low)
+    _data = dist_matrix[lipid_id_set_low, frame_id_set_low]
+    return residue_id, contact_low, contact_high, _col, _row, _data
+
+
 class LipidInteraction:
     def __init__(self, trajfile_list, cutoffs=[0.475, 0.7], lipid="CHOL", topfile_list=None, lipid_atoms=None,
-                 nprot=1, resi_offset=0, save_dir=None, timeunit="us", stride=1, dt_traj=None):
+                 nprot=1, resi_offset=0, save_dir=None, timeunit="us", stride=1, dt_traj=None, num_cpus=None, hpc=False):
 
         """The main class that handles calculation and controls workflow.
 
@@ -128,6 +160,15 @@ class LipidInteraction:
             Timestep of trajectories. It is required when trajectories do not have timestep information. Not needed for
             trajectory formats of e.g. xtc, trr etc. If None, timestep information will take from trajectories.
 
+        num_cpus : int, default=None
+            number of threads to use for parallelising residue contact calculations. If unspecified by the run script, will default
+            to all available processors accessible to the system.
+
+        hpc: bool, default=False
+            If statement to gate usage of the multiprocessing parallelisation, which likely isn't worthwhile on local machine,            
+            and since process/memory allocation works differently on windows and linux OS. 
+            Set True through run script to parallelise residue contact calculation
+
         """
         self._trajfile_list = np.atleast_1d(trajfile_list)
         if len(np.atleast_1d(topfile_list)) == len(self._trajfile_list):
@@ -145,6 +186,8 @@ class LipidInteraction:
         else:
             raise ValueError("cutoffs should be either a scalar or a list of two scalars.")
 
+        self._hpc = hpc
+        self._num_cpus = num_cpus
         self._dt_traj = dt_traj
         self._lipid = lipid
         self._lipid_atoms = lipid_atoms
@@ -386,33 +429,58 @@ class LipidInteraction:
             lipid_boundaries = np.concatenate([[0], np.cumsum(lipid_sizes)])
             n_lipids = len(traj_info["lipid_residue_atomid_list"])
             for protein_idx in np.arange(self._nprot, dtype=int):
-                for residue_id, residue_atom_indices in enumerate(
-                        tqdm(traj_info["protein_residue_atomid_list"][protein_idx],
-                             desc="  Traj {:d} prot {:d} residues".format(traj_idx, protein_idx),
-                             leave=False)):
-                    # Single compute_distances call for all lipid atoms at once.
-                    # Shape: (n_frames, n_residue_atoms * n_flat_lipid_atoms)
-                    all_pairs = np.array(list(product(residue_atom_indices, flat_lipid_atoms)))
-                    all_dists = md.compute_distances(traj, all_pairs, periodic=True, opt=True)
-                    # all_dists shape: (n_frames, n_res_atoms * n_flat_lipid_atoms)
-                    # Reduce to (n_frames, n_flat_lipid_atoms) by taking min over residue atoms
-                    n_res_atoms = len(residue_atom_indices)
-                    n_flat = len(flat_lipid_atoms)
-                    # reshape: (n_frames, n_res_atoms, n_flat_lipid_atoms) → min over axis 1
-                    per_atom_dists = all_dists.reshape(traj.n_frames, n_res_atoms, n_flat).min(axis=1)
-                    # (n_frames, n_flat_lipid_atoms) → per lipid min using boundaries
-                    # np.minimum.reduceat operates along axis=1 (columns = lipid atoms)
-                    dist_matrix = np.minimum.reduceat(per_atom_dists, lipid_boundaries[:-1], axis=1).T
-                    # dist_matrix shape: (n_lipids, n_frames) — same as before
-                    contact_low, frame_id_set_low, lipid_id_set_low = cal_contact_residues(dist_matrix, self._cutoffs[0])
-                    contact_high, _, _ = cal_contact_residues(dist_matrix, self._cutoffs[1])
-                    self._contact_residues_high[residue_id].append(contact_high)
-                    self._contact_residues_low[residue_id].append(contact_low)
-                    # update coordinates for coo_matrix
-                    col.append([ncol_start + ncol_per_protein * protein_idx + lipid_id * traj.n_frames +
-                                frame_id for frame_id, lipid_id in zip(frame_id_set_low, lipid_id_set_low)])
-                    row.append([residue_id for dummy in np.arange(len(frame_id_set_low), dtype=int)])
-                    data.append(dist_matrix[lipid_id_set_low, frame_id_set_low])
+                if (self._hpc):
+                    # parallelised computation for hpc or linux OS workstation (
+                    # -- linux OS handles memory allocation/process generation differently to windows, no idea about macOS (should  be similar to linux??),
+                    # ---- so this method will probably not work on other OS systems, may be worth debugging, but unlikely to be worthwile? but should be possible
+                    print("DEBUG - HPC MODE")
+                    # creates list of (residue,(residue atoms), ...) to analyse, with args for global func process_res  
+                    to_process = [
+                        (residue_atom_indices, self._cutoffs, ncol_start, ncol_per_protein, protein_idx, residue_id)
+                        for residue_id, residue_atom_indices in enumerate(traj_info["protein_residue_atomid_list"][protein_idx])
+                    ]
+                    # initialises #num_cpus parallel threads, init_worker function called once per thread at initialisation, sets global traj so it isn't passed every iteration
+                    with Pool(processes=self._num_cpus, initializer=init_worker, initargs=(traj, traj_info["lipid_residue_atomid_list"])) as pool:
+                        # equivalent of openMP for, calling global func process_res as iteratable, chunksize 1 is ~~close to schedule dynamic 
+                        results = pool.map(process_res, to_process, chunksize=1) 
+                    # serialise results from parallel computation
+                    # results are collated in resid ascending order from pool.map, no need to sort
+                    for residue_id, contact_low, contact_high, _col, _row, _data in results:
+                        self._contact_residues_high[residue_id].append(contact_high)
+                        self._contact_residues_low[residue_id].append(contact_low)
+                        col.append(_col)
+                        row.append(_row)
+                        data.append(_data)
+                else:
+                    # non parallelised computation
+                    for residue_id, residue_atom_indices in enumerate(
+                            tqdm(traj_info["protein_residue_atomid_list"][protein_idx],
+                                desc="  Traj {:d} prot {:d} residues".format(traj_idx, protein_idx),
+                                leave=False)):
+                        print("DEBUG - NON-HPC MODE")
+                        # Single compute_distances call for all lipid atoms at once.
+                        # Shape: (n_frames, n_residue_atoms * n_flat_lipid_atoms)
+                        all_pairs = np.array(list(product(residue_atom_indices, flat_lipid_atoms)))
+                        all_dists = md.compute_distances(traj, all_pairs, periodic=True, opt=True)
+                        # all_dists shape: (n_frames, n_res_atoms * n_flat_lipid_atoms)
+                        # Reduce to (n_frames, n_flat_lipid_atoms) by taking min over residue atoms
+                        n_res_atoms = len(residue_atom_indices)
+                        n_flat = len(flat_lipid_atoms)
+                        # reshape: (n_frames, n_res_atoms, n_flat_lipid_atoms) → min over axis 1
+                        per_atom_dists = all_dists.reshape(traj.n_frames, n_res_atoms, n_flat).min(axis=1)
+                        # (n_frames, n_flat_lipid_atoms) → per lipid min using boundaries
+                        # np.minimum.reduceat operates along axis=1 (columns = lipid atoms)
+                        dist_matrix = np.minimum.reduceat(per_atom_dists, lipid_boundaries[:-1], axis=1).T
+                        # dist_matrix shape: (n_lipids, n_frames) — same as before
+                        contact_low, frame_id_set_low, lipid_id_set_low = cal_contact_residues(dist_matrix, self._cutoffs[0])
+                        contact_high, _, _ = cal_contact_residues(dist_matrix, self._cutoffs[1])
+                        self._contact_residues_high[residue_id].append(contact_high)
+                        self._contact_residues_low[residue_id].append(contact_low)
+                        # update coordinates for coo_matrix
+                        col.append([ncol_start + ncol_per_protein * protein_idx + lipid_id * traj.n_frames +
+                                    frame_id for frame_id, lipid_id in zip(frame_id_set_low, lipid_id_set_low)])
+                        row.append([residue_id for dummy in np.arange(len(frame_id_set_low), dtype=int)])
+                        data.append(dist_matrix[lipid_id_set_low, frame_id_set_low])
 
             ncol_start += ncol_per_protein * self._nprot
         # calculate correlation coefficient matrix
